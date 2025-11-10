@@ -17,19 +17,18 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
         Interfaces
 ///////////////////////*/
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {IUniswapV2Router02} from '@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol';
+import {IUniswapV2Router02} from "@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol";
 
 contract KipuBankV3 is AccessControl, ReentrancyGuard {
-    
     /*///////////////////////
         Type declarations
     ///////////////////////*/
     using SafeERC20 for IERC20;
-    
+
     /*///////////////////////
             Variables
     ///////////////////////*/
-    bytes32 private constant ADMIN_ROLE = keccak256("ADMIN_ROLE"); 
+    bytes32 private constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
 
     IUniswapV2Router02 public immutable i_router;
     address public immutable i_usdcToken;
@@ -40,7 +39,7 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
 
     uint256 public immutable i_maxTransaction;
     uint256 public immutable i_bankCap;
-    
+
     uint256 private depositsCount;
     uint256 private withdrawalsCount;
     uint256 private balanceUSDC;
@@ -53,11 +52,7 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
     event KipuBank_DepositSuccessful(address indexed user, uint256 usdcAmount);
     event KipuBank_WithdrawSuccessful(address indexed user, uint256 amount);
     event KipuBank_SwapExecuted(
-        address indexed user,
-        address indexed tokenIn,
-        address indexed tokenOut,
-        uint256 amountIn,
-        uint256 amountOut
+        address indexed user, address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut
     );
     event KipuBank_AdminAdded(address indexed newAdmin);
     event KipuBank_EmergencyWithdraw(address indexed token, uint256 amount);
@@ -107,7 +102,7 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
      * @param _router Direccion del Uniswap V2 Router
      * @param _usdc Direccion del token USDC
      */
-    constructor(uint256 _amountBankCap,uint256 _maxTransaction, address _admin, address _router, address _usdc) {
+    constructor(uint256 _amountBankCap, uint256 _maxTransaction, address _admin, address _router, address _usdc) {
         if (_admin == address(0) || _router == address(0) || _usdc == address(0)) {
             revert KipuBank_InvalidAddress(address(0));
         }
@@ -118,7 +113,7 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
 
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(ADMIN_ROLE, _admin);
-        
+
         i_router = IUniswapV2Router02(_router);
         i_usdcToken = _usdc;
         i_bankCap = _amountBankCap;
@@ -128,7 +123,7 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
     /*/////////////////////
         Receive & Fallback
     /////////////////////*/
-    
+
     receive() external payable {
         depositETH();
     }
@@ -155,15 +150,12 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
         uint256 minUSDC = (estimatedUSDC * SLIPPAGE_TOLERANCE) / SLIPPAGE_DENOMINATOR;
 
         uint256[] memory amounts = i_router.swapExactETHForTokens{value: msg.value}(
-            minUSDC,
-            path,
-            address(this),
-            block.timestamp + SWAP_DEADLINE
+            minUSDC, path, address(this), block.timestamp + SWAP_DEADLINE
         );
 
         uint256 usdcReceived = amounts[1];
 
-        //Puede pasar que la estimacion sea menor a lo obtenido realmente 
+        //Puede pasar que la estimacion sea menor a lo obtenido realmente
         if (balanceUSDC + usdcReceived > i_bankCap) {
             revert KipuBank_DepositAmountExceeded(balanceUSDC, i_bankCap);
         }
@@ -182,27 +174,26 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
      * @param _tokenIn Dirección del token a depositar
      * @dev Si el token es USDC, se deposita directamente. Si es otro token, se hace swap.
      */
-    function depositERC20(uint256 _amountIn, address _tokenIn) external nonReentrant validateDeposit(_amountIn, _tokenIn) {
+    function depositERC20(uint256 _amountIn, address _tokenIn)
+        external
+        nonReentrant
+        validateDeposit(_amountIn, _tokenIn)
+    {
         uint256 usdcReceived;
 
         IERC20(_tokenIn).safeTransferFrom(msg.sender, address(this), _amountIn);
 
-        if (_tokenIn == i_usdcToken) {// Caso 1: Depósito directo de USDC
+        if (_tokenIn == i_usdcToken) {
+            // Caso 1: Depósito directo de USDC
             usdcReceived = _amountIn;
-
-        } else {// Caso 2: Swap Token -> USDC
+        } else {
+            // Caso 2: Swap Token -> USDC
             usdcReceived = _swapTokenToUSDC(_tokenIn, _amountIn);
-            
-            emit KipuBank_SwapExecuted(
-                msg.sender,
-                _tokenIn,
-                i_usdcToken,
-                _amountIn,
-                usdcReceived
-            );
+
+            emit KipuBank_SwapExecuted(msg.sender, _tokenIn, i_usdcToken, _amountIn, usdcReceived);
         }
 
-        //Puede pasar que la estimacion sea menor a lo obtenido realmente 
+        //Puede pasar que la estimacion sea menor a lo obtenido realmente
         if (balanceUSDC + usdcReceived > i_bankCap) {
             revert KipuBank_DepositAmountExceeded(balanceUSDC, i_bankCap);
         }
@@ -230,13 +221,7 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
 
         withdrawalsCount++;
 
-        emit KipuBank_SwapExecuted(
-            msg.sender,
-            i_usdcToken,
-            i_router.WETH(),
-            _amountUSDC,
-            ethReceived
-        );
+        emit KipuBank_SwapExecuted(msg.sender, i_usdcToken, i_router.WETH(), _amountUSDC, ethReceived);
         emit KipuBank_WithdrawSuccessful(msg.sender, ethReceived);
     }
 
@@ -245,7 +230,11 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
      * @param _amountUSDC Cantidad de USDC a gastar
      * @param _tokenOut Token que se desea recibir (usar i_usdcToken para USDC directo)
      */
-    function withdrawERC20(uint256 _amountUSDC, address _tokenOut) external nonReentrant validateWithdrawal(_amountUSDC) {
+    function withdrawERC20(uint256 _amountUSDC, address _tokenOut)
+        external
+        nonReentrant
+        validateWithdrawal(_amountUSDC)
+    {
         if (_tokenOut == address(0)) revert KipuBank_InvalidAddress(_tokenOut); //Para ETH esta el metodo withdrawETH
 
         s_userBalances[msg.sender] -= _amountUSDC;
@@ -258,14 +247,8 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
             tokenAmountOut = _amountUSDC;
         } else {
             tokenAmountOut = _swapUSDCToToken(_amountUSDC, _tokenOut, msg.sender);
-            
-            emit KipuBank_SwapExecuted(
-                msg.sender,
-                i_usdcToken,
-                _tokenOut,
-                _amountUSDC,
-                tokenAmountOut
-            );
+
+            emit KipuBank_SwapExecuted(msg.sender, i_usdcToken, _tokenOut, _amountUSDC, tokenAmountOut);
         }
 
         withdrawalsCount++;
@@ -286,56 +269,57 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
         emit KipuBank_AdminAdded(_newAdmin);
     }
 
-
     /*/////////////////////
         Internal Functions
     /////////////////////*/
 
-
     /**
-     * @notice Valida que se pueda depositar el token. 
+     * @notice Valida que se pueda depositar el token.
      * @param _amount Cantidad que se quiere depositar.
      * @param _token Token que se quiere depositar.
      */
-    function _validateDeposit(uint256 _amount, address _token) internal view{
+    function _validateDeposit(uint256 _amount, address _token) internal view {
         if (_amount == 0) revert KipuBank_InvalidAmount(_amount);
 
         uint256 estimatedUSDC = _estimateUSDCamount(_amount, _token);
-        if (estimatedUSDC > i_maxTransaction) 
+        if (estimatedUSDC > i_maxTransaction) {
             revert KipuBank_TransactionAmountExceeded(_amount, i_maxTransaction);
+        }
 
-        if (balanceUSDC + estimatedUSDC > i_bankCap)
+        if (balanceUSDC + estimatedUSDC > i_bankCap) {
             revert KipuBank_DepositAmountExceeded(balanceUSDC, i_bankCap);
+        }
     }
 
-
     /**
-     * @notice Valida que se pueda retirar ese monto de USDC. 
+     * @notice Valida que se pueda retirar ese monto de USDC.
      * @param _amountUSDC Cantidad de USDC que se quiere retirar.
      */
     function _validateWithdrawal(uint256 _amountUSDC) internal view {
         uint256 userBalance = s_userBalances[msg.sender];
-        if (_amountUSDC > userBalance) 
+        if (_amountUSDC > userBalance) {
             revert KipuBank_InsufficientBalance(_amountUSDC, userBalance);
-        if (_amountUSDC > i_maxTransaction) 
+        }
+        if (_amountUSDC > i_maxTransaction) {
             revert KipuBank_TransactionAmountExceeded(_amountUSDC, i_maxTransaction);
+        }
         if (_amountUSDC == 0) revert KipuBank_InvalidAmount(_amountUSDC);
     }
 
     /**
-     *  @notice Estima la cantidad de USDC a ser recibida. 
+     *  @notice Estima la cantidad de USDC a ser recibida.
      *  @param _amountIn Cantidad del token a convertir.
-     *  @param _tokenIn Direccion del token a transmitir. 
+     *  @param _tokenIn Direccion del token a transmitir.
      */
-    function _estimateUSDCamount(uint256 _amountIn, address _tokenIn) internal view returns(uint256 estimatedUSDC){
+    function _estimateUSDCamount(uint256 _amountIn, address _tokenIn) internal view returns (uint256 estimatedUSDC) {
         if (_tokenIn == i_usdcToken) {
             return _amountIn;
         }
-    
+
         address[] memory path = new address[](2);
         path[0] = _tokenIn;
         path[1] = i_usdcToken;
-        
+
         uint256[] memory amountsOut = i_router.getAmountsOut(_amountIn, path);
         return amountsOut[1];
     }
@@ -357,13 +341,8 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
         uint256 expectedUSDC = amountsOut[1];
         uint256 minUSDC = (expectedUSDC * SLIPPAGE_TOLERANCE) / SLIPPAGE_DENOMINATOR;
 
-        uint256[] memory amounts = i_router.swapExactTokensForTokens(
-            _amountIn,
-            minUSDC,
-            path,
-            address(this),
-            block.timestamp + SWAP_DEADLINE
-        );
+        uint256[] memory amounts =
+            i_router.swapExactTokensForTokens(_amountIn, minUSDC, path, address(this), block.timestamp + SWAP_DEADLINE);
 
         usdcOut = amounts[1];
     }
@@ -374,7 +353,7 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
      * @param _recipient Receptor del ETH
      * @return ethOut Cantidad de ETH recibida
      */
-    function _swapUSDCToETH(uint256 _amountUSDC, address _recipient) internal returns (uint256 ethOut){
+    function _swapUSDCToETH(uint256 _amountUSDC, address _recipient) internal returns (uint256 ethOut) {
         SafeERC20.forceApprove(IERC20(i_usdcToken), address(i_router), _amountUSDC);
 
         address[] memory path = new address[](2);
@@ -385,13 +364,8 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
         uint256 expectedETH = amountsOut[1];
         uint256 minETH = (expectedETH * SLIPPAGE_TOLERANCE) / SLIPPAGE_DENOMINATOR;
 
-        uint256[] memory amounts = i_router.swapExactTokensForETH(
-            _amountUSDC,
-            minETH,
-            path,
-            _recipient,
-            block.timestamp + SWAP_DEADLINE
-        );
+        uint256[] memory amounts =
+            i_router.swapExactTokensForETH(_amountUSDC, minETH, path, _recipient, block.timestamp + SWAP_DEADLINE);
 
         ethOut = amounts[1];
     }
@@ -403,7 +377,10 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
      * @param _recipient Receptor del token
      * @return tokenOut Cantidad del token recibida
      */
-    function _swapUSDCToToken(uint256 _amountUSDC, address _tokenOut, address _recipient) internal returns (uint256 tokenOut){
+    function _swapUSDCToToken(uint256 _amountUSDC, address _tokenOut, address _recipient)
+        internal
+        returns (uint256 tokenOut)
+    {
         SafeERC20.forceApprove(IERC20(i_usdcToken), address(i_router), _amountUSDC);
 
         address[] memory path = new address[](2);
@@ -414,18 +391,11 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
         uint256 expectedToken = amountsOut[1];
         uint256 minToken = (expectedToken * SLIPPAGE_TOLERANCE) / SLIPPAGE_DENOMINATOR;
 
-        uint256[] memory amounts = i_router.swapExactTokensForTokens(
-            _amountUSDC,
-            minToken,
-            path,
-            _recipient,
-            block.timestamp + SWAP_DEADLINE
-        );
+        uint256[] memory amounts =
+            i_router.swapExactTokensForTokens(_amountUSDC, minToken, path, _recipient, block.timestamp + SWAP_DEADLINE);
 
         tokenOut = amounts[1];
     }
-
-
 
     /*/////////////////////
         View Functions
@@ -463,7 +433,7 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
      * @param _amountUSDC Cantidad de USDC a gastar
      * @return estimatedETH Cantidad estimada de ETH
      */
-    function estimateWithdrawETH(uint256 _amountUSDC) external view returns (uint256 estimatedETH){
+    function estimateWithdrawETH(uint256 _amountUSDC) external view returns (uint256 estimatedETH) {
         address[] memory path = new address[](2);
         path[0] = i_usdcToken;
         path[1] = i_router.WETH();
@@ -478,7 +448,11 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
      * @param _tokenOut Token que deseas recibir
      * @return estimatedTokens Cantidad estimada del token
      */
-    function estimateWithdrawERC20(uint256 _amountUSDC, address _tokenOut) external view returns (uint256 estimatedTokens){
+    function estimateWithdrawERC20(uint256 _amountUSDC, address _tokenOut)
+        external
+        view
+        returns (uint256 estimatedTokens)
+    {
         if (_tokenOut == i_usdcToken) {
             return _amountUSDC;
         }
