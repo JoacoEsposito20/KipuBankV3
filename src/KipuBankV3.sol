@@ -2,8 +2,8 @@
 pragma solidity 0.8.30;
 
 /*
-@title KipuBank
-@notice Este contrato representa un banco personal.
+@title KipuBankV3
+@notice Banco DeFi avanzado que acepta cualquier token Uniswap V2 y lo convierte a USDC.
 */
 
 /*///////////////////////
@@ -11,8 +11,7 @@ pragma solidity 0.8.30;
 ///////////////////////*/
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
-import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
-
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /*///////////////////////
         Interfaces
@@ -20,125 +19,79 @@ import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interf
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IUniswapV2Router02} from '@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol';
 
-contract KipuBank is AccessControl{
+contract KipuBankV3 is AccessControl, ReentrancyGuard {
+    
     /*///////////////////////
         Type declarations
     ///////////////////////*/
     using SafeERC20 for IERC20;
-    struct tokenERC20{
-        bool isSupported;
-        IERC20  token;
-    }
     
     /*///////////////////////
             Variables
     ///////////////////////*/
-    bytes32 private constant ADMIN_ROLE = keccak256("ADMIN_ROLE"); //@notice Crea el rol de Administrador del banco. 
+    bytes32 private constant ADMIN_ROLE = keccak256("ADMIN_ROLE"); 
 
-    AggregatorV3Interface private s_feeds;//0x694AA1769357215DE4FAC081bf1f309aDC325306 Ethereum ETH/USD
-    IUniswapV2Router02 immutable i_router;
+    IUniswapV2Router02 public immutable i_router;
+    address public immutable i_usdcToken;
 
-    uint256 constant DECIMAL_FACTOR = 1 * 10 ** 20; //@notice Constante para almacenar el factor de decimales
-    uint16 constant ORACLE_HEARTBEAT = 3600; //@notice Constante para almacenar el latido (heartbeat) del Data Feed
+    uint256 private constant SLIPPAGE_TOLERANCE = 98; // 2% slippage tolerance
+    uint256 private constant SLIPPAGE_DENOMINATOR = 100;
+    uint256 private constant SWAP_DEADLINE = 300; // 5 minutos
 
-    mapping (address token => tokenERC20) private s_supportedTokens; //@notice Son los ERC20 aceptados por el banco. Los determina el/los admin/s.  
-    mapping (address user =>  mapping (address token => uint256 saldo)) private s_users; //@notice Mapa que almacena los usuarios con el saldo de sus tokens
-
-    uint256 private immutable i_maxTransaction = 1000000000000000000; //@notice Determina el maximo por transaccion.
-    uint256 private immutable i_bankCap; //@notice Determina el maximo de deposito en el banco. Esto ahora queda determinado en USD. 
-    uint256 private depositsCount; //@notice Numero de depositos realizados
-    uint256 private withdrawalsCount; //@notice Numero de retiros realizados
-    uint256 private balanceUSDC; //@notice Balance total expresado en USDC
-
+    uint256 public immutable i_maxTransaction;
+    uint256 public immutable i_bankCap;
     
+    uint256 private depositsCount;
+    uint256 private withdrawalsCount;
+    uint256 private balanceUSDC;
+
+    mapping(address user => uint256 balance) private s_userBalances;
 
     /*/////////////////////
             Events
     /////////////////////*/
+    event KipuBank_DepositSuccessful(address indexed user, uint256 usdcAmount);
+    event KipuBank_WithdrawSuccessful(address indexed user, uint256 amount);
+    event KipuBank_SwapExecuted(
+        address indexed user,
+        address indexed tokenIn,
+        address indexed tokenOut,
+        uint256 amountIn,
+        uint256 amountOut
+    );
+    event KipuBank_AdminAdded(address indexed newAdmin);
+    event KipuBank_EmergencyWithdraw(address indexed token, uint256 amount);
 
-    //@notice Evento que se lanza cuando se realiza correctamente un deposito.
-    event KipuBank_DepositSuccessful(uint256);
-    //@notice Evento que se lanza cuando se realiza correctamente un retiro.
-    event KipuBank_WithdrawSuccessful(uint256);
-    //@ Evento que se lanza cuando un token nuevo se agrega correctamente.
-    event KipuBank_TokenAddedSuccessfully(address);
-    //@ Evento que se lanza cuando un token nuevo se agrega correctamente.
-    event KipuBank_TokenDeletedSuccessfully(address);
-    //@ Evento que se lanza cuando se actualiza el feed de Chainlink
-    event KipuBank_ChainlinkFeedUpdated(address);
-    
     /*/////////////////////
             Errors
     /////////////////////*/
-
-    //@notice Error que se lanza cuando se excede el bankCap
-    error KipuBank_DepositAmountExceeded(uint256);
-    //@notice Error que se lanza cuando se realiza un deposito invalido
-    error KipuBank_InvalidAmount(uint256);
-    //@notice Error que se lanza cuando se excede el monto maximo por transaccion
-    error KipuBank_TransactionAmountExceeded(uint256,uint256);
-    //@notice Error que se lanza cuando no hay saldo disponsible
-    error KipuBank_InsufficientBalance(uint256);
-    //@notice Error que se lanza cuando no se puede transferir ETH
-    error KipuBank_TransferFailed(bytes);
-    //@notice Error que se lanza si quien quiere ejecutar una funcion no tiene un rol valido.
-    error KipuBank_CallerNotAdmin(address);
-    //@notice Error que se lanza cuando el token no es aceptado.
-    error KipuBank_TokenNotSupported(address);
-    //@notice error emitido cuando el retorno del oráculo es incorrecto
-    error KipuBank_OracleCompromised();
-    //@notice error emitido cuando la última actualización del oráculo supera el heartbeat
-    error KipuBank_StalePrice();
+    error KipuBank_DepositAmountExceeded(uint256 currentBalance, uint256 bankCap);
+    error KipuBank_InvalidAmount(uint256 amount);
+    error KipuBank_TransactionAmountExceeded(uint256 amount, uint256 maxTransaction);
+    error KipuBank_InsufficientBalance(uint256 requested, uint256 available);
+    error KipuBank_CallerNotAdmin(address caller);
+    error KipuBank_InvalidAddress(address addr);
+    error KipuBank_SwapFailed(string reason);
+    error KipuBank_SlippageTooHigh(uint256 expected, uint256 minimum);
 
     /*//////////////////////////
             Modifiers
     //////////////////////////*/
 
-    /*
-     @notice valida que el deposito se pueda realizar
-    */
-    modifier validateDepositETH(){
-        if(msg.value <= 0) revert KipuBank_InvalidAmount(msg.value); 
-        if(convertEthInUSD(msg.value)+balanceUSDC > i_bankCap) revert KipuBank_DepositAmountExceeded(balanceUSDC);
-        if(msg.value > i_maxTransaction) revert KipuBank_TransactionAmountExceeded(msg.value,i_maxTransaction);
-        _;
-    }   
-
-    /*
-     @notice valida que el retiro se pueda realizar
-     @param _amount es el monto que se quiere retirar
-    */
-    modifier validateWithdrawal(uint256 _amount, address _token){
-        if(!s_supportedTokens[_token].isSupported) revert KipuBank_TokenNotSupported(_token);
-        if(_amount > s_users[msg.sender][_token]) revert KipuBank_InsufficientBalance(s_users[msg.sender][_token]);
-        if(_amount > i_maxTransaction) revert KipuBank_TransactionAmountExceeded(_amount,i_maxTransaction);
-        if(_amount <= 0) revert KipuBank_InvalidAmount(_amount); 
+    modifier validateDeposit(uint256 _amount, address _token) {
+        _validateDeposit(_amount, _token);
         _;
     }
 
-    /*
-     @notice Valida que se pueda depositar ese token ERC20
-    */
-    modifier validateDepositERC20(address _token){
-        if(!s_supportedTokens[_token].isSupported) revert KipuBank_TokenNotSupported(_token);
+    modifier validateWithdrawal(uint256 _amountUSDC) {
+        _validateWithdrawal(_amountUSDC);
         _;
     }
 
-    /*
-     @notice valida que el llamador sea un admin
-    */
-    modifier isAdmin(){
-        if(!hasRole(ADMIN_ROLE,msg.sender)){
+    modifier onlyAdmin() {
+        if (!hasRole(ADMIN_ROLE, msg.sender)) {
             revert KipuBank_CallerNotAdmin(msg.sender);
         }
-        _;
-    }
-
-    /*
-     @notice valida que el token sea aceptado
-    */
-    modifier tokenIsSupported(address _token){
-        if(!s_supportedTokens[_token].isSupported) revert KipuBank_TokenNotSupported(_token);
         _;
     }
 
@@ -146,198 +99,395 @@ contract KipuBank is AccessControl{
             Constructor
     /////////////////////*/
 
-    /*
-     @notice Constructor del contrato
-     @param _amountBankCap es el monto maximo que puede almacenar el banco
-    */
-    constructor(uint256 _amountBankCap, address _admin, address _feed, address _router){
+    /**
+     * @notice Constructor del contrato KipuBankV3
+     * @param _amountBankCap Capacidad maxima del banco en USDC (con decimales)
+     * @param _maxTransaction Monto maximo por transacción
+     * @param _admin Direccion del administrador inicial
+     * @param _router Direccion del Uniswap V2 Router
+     * @param _usdc Direccion del token USDC
+     */
+    constructor(uint256 _amountBankCap,uint256 _maxTransaction, address _admin, address _router, address _usdc) {
+        if (_admin == address(0) || _router == address(0) || _usdc == address(0)) {
+            revert KipuBank_InvalidAddress(address(0));
+        }
+
         balanceUSDC = 0;
         depositsCount = 0;
         withdrawalsCount = 0;
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(ADMIN_ROLE, _admin);
-        s_supportedTokens[address(0)].isSupported = true;
-        s_feeds = AggregatorV3Interface(_feed);
+        
         i_router = IUniswapV2Router02(_router);
-        i_bankCap = convertEthInUSD(_amountBankCap);      
+        i_usdcToken = _usdc;
+        i_bankCap = _amountBankCap;
+        i_maxTransaction = _maxTransaction;
     }
 
     /*/////////////////////
-            Functions
+        Receive & Fallback
     /////////////////////*/
     
-    /*///// Funciones de ETH ////////////*/
     receive() external payable {
-        _depositETHLogic();
+        depositETH();
     }
 
     fallback() external payable {
-        _depositETHLogic();
-     }
-    
-    /*
-     @notice Realiza el deposito
-    */
-    function depositETH()external payable{
-        _depositETHLogic();
+        depositETH();
     }
 
-    /*
-     @notice Realiza la logica del deposito
-    */
-    function _depositETHLogic() private validateDepositETH(){
-        s_users[msg.sender][address(0)] += msg.value;
-        balanceUSDC += convertEthInUSD(msg.value);
+    /*/////////////////////
+        Deposit Functions
+    /////////////////////*/
+
+    /**
+     * @notice Deposita ETH y lo convierte automaticamente a USDC
+     * @dev Usa Uniswap V2 para el swap con protección de slippage del 2%
+     * Sigue el patrón CEI (Checks-Effects-Interactions)
+     */
+    function depositETH() public payable nonReentrant validateDeposit(msg.value, i_router.WETH()) {
+        address[] memory path = new address[](2);
+        path[0] = i_router.WETH();
+        path[1] = i_usdcToken;
+
+        uint256 estimatedUSDC = _estimateUSDCamount(msg.value, path[0]);
+        uint256 minUSDC = (estimatedUSDC * SLIPPAGE_TOLERANCE) / SLIPPAGE_DENOMINATOR;
+
+        uint256[] memory amounts = i_router.swapExactETHForTokens{value: msg.value}(
+            minUSDC,
+            path,
+            address(this),
+            block.timestamp + SWAP_DEADLINE
+        );
+
+        uint256 usdcReceived = amounts[1];
+
+        //Puede pasar que la estimacion sea menor a lo obtenido realmente 
+        if (balanceUSDC + usdcReceived > i_bankCap) {
+            revert KipuBank_DepositAmountExceeded(balanceUSDC, i_bankCap);
+        }
+
+        s_userBalances[msg.sender] += usdcReceived;
+        balanceUSDC += usdcReceived;
         depositsCount++;
-        emit KipuBank_DepositSuccessful(msg.value);
+
+        emit KipuBank_SwapExecuted(msg.sender, path[0], path[1], msg.value, usdcReceived);
+        emit KipuBank_DepositSuccessful(msg.sender, usdcReceived);
     }
 
-    /*
-     @notice Realiza el retiro
-     @param _amount es el monto que se quiere retirar
-    */
-    function withdrawETH(uint256 _amount) external validateWithdrawal(_amount, address(0)){
-        s_users[msg.sender][address(0)] -= _amount;
-        balanceUSDC -= convertEthInUSD(_amount);
-        _transferETH(payable(msg.sender),_amount);
+    /**
+     * @notice Deposita cualquier token ERC20 y lo convierte a USDC
+     * @param _amountIn Cantidad del token a depositar
+     * @param _tokenIn Dirección del token a depositar
+     * @dev Si el token es USDC, se deposita directamente. Si es otro token, se hace swap.
+     */
+    function depositERC20(uint256 _amountIn, address _tokenIn) external nonReentrant validateDeposit(_amountIn, _tokenIn) {
+        uint256 usdcReceived;
+
+        IERC20(_tokenIn).safeTransferFrom(msg.sender, address(this), _amountIn);
+
+        if (_tokenIn == i_usdcToken) {// Caso 1: Depósito directo de USDC
+            usdcReceived = _amountIn;
+
+        } else {// Caso 2: Swap Token -> USDC
+            usdcReceived = _swapTokenToUSDC(_tokenIn, _amountIn);
+            
+            emit KipuBank_SwapExecuted(
+                msg.sender,
+                _tokenIn,
+                i_usdcToken,
+                _amountIn,
+                usdcReceived
+            );
+        }
+
+        //Puede pasar que la estimacion sea menor a lo obtenido realmente 
+        if (balanceUSDC + usdcReceived > i_bankCap) {
+            revert KipuBank_DepositAmountExceeded(balanceUSDC, i_bankCap);
+        }
+
+        s_userBalances[msg.sender] += usdcReceived;
+        balanceUSDC += usdcReceived;
+        depositsCount++;
+
+        emit KipuBank_DepositSuccessful(msg.sender, usdcReceived);
+    }
+
+    /*/////////////////////
+        Withdraw Functions
+    /////////////////////*/
+
+    /**
+     * @notice Retira una cantidad de USDC en ETH
+     * @param _amountUSDC Cantidad de USDC a gastar para obtener ETH
+     */
+    function withdrawETH(uint256 _amountUSDC) external nonReentrant validateWithdrawal(_amountUSDC) {
+        s_userBalances[msg.sender] -= _amountUSDC;
+        balanceUSDC -= _amountUSDC;
+
+        uint256 ethReceived = _swapUSDCToETH(_amountUSDC, msg.sender);
+
         withdrawalsCount++;
-        emit KipuBank_WithdrawSuccessful(_amount);
+
+        emit KipuBank_SwapExecuted(
+            msg.sender,
+            i_usdcToken,
+            i_router.WETH(),
+            _amountUSDC,
+            ethReceived
+        );
+        emit KipuBank_WithdrawSuccessful(msg.sender, ethReceived);
     }
 
-    /*///// Funciones Tokens ERC20 ////////////*/
+    /**
+     * @notice Retira en USDC o en otro token ERC20
+     * @param _amountUSDC Cantidad de USDC a gastar
+     * @param _tokenOut Token que se desea recibir (usar i_usdcToken para USDC directo)
+     */
+    function withdrawERC20(uint256 _amountUSDC, address _tokenOut) external nonReentrant validateWithdrawal(_amountUSDC) {
+        if (_tokenOut == address(0)) revert KipuBank_InvalidAddress(_tokenOut); //Para ETH esta el metodo withdrawETH
 
-    /*
-     @notice Funcion para depositar tokens ERC20
-     @param _amount es el monto que se quiere depositar
-     @param _token es el token que se quiere depositar
-    */
-    function depositERC20(uint256 _amount, address _token)external tokenIsSupported(_token){
-        s_users[msg.sender][_token] += _amount;
-        depositsCount++;
-        //Estimo cantidad
-        //Sumo BalanceUSDC
+        s_userBalances[msg.sender] -= _amountUSDC;
+        balanceUSDC -= _amountUSDC;
 
-        emit KipuBank_DepositSuccessful(_amount);
+        uint256 tokenAmountOut;
+
+        if (_tokenOut == i_usdcToken) {
+            IERC20(i_usdcToken).safeTransfer(msg.sender, _amountUSDC);
+            tokenAmountOut = _amountUSDC;
+        } else {
+            tokenAmountOut = _swapUSDCToToken(_amountUSDC, _tokenOut, msg.sender);
+            
+            emit KipuBank_SwapExecuted(
+                msg.sender,
+                i_usdcToken,
+                _tokenOut,
+                _amountUSDC,
+                tokenAmountOut
+            );
+        }
+
+        withdrawalsCount++;
+        emit KipuBank_WithdrawSuccessful(msg.sender, tokenAmountOut);
+    }
+
+    /*/////////////////////
+        Admin Functions
+    /////////////////////*/
+
+    /**
+     * @notice Agrega un nuevo administrador
+     * @param _newAdmin Dirección del nuevo administrador
+     */
+    function addAdmin(address _newAdmin) external onlyAdmin {
+        if (_newAdmin == address(0)) revert KipuBank_InvalidAddress(_newAdmin);
+        _grantRole(ADMIN_ROLE, _newAdmin);
+        emit KipuBank_AdminAdded(_newAdmin);
+    }
+
+
+    /*/////////////////////
+        Internal Functions
+    /////////////////////*/
+
+
+    /**
+     * @notice Valida que se pueda depositar el token. 
+     * @param _amount Cantidad que se quiere depositar.
+     * @param _token Token que se quiere depositar.
+     */
+    function _validateDeposit(uint256 _amount, address _token) internal view{
+        if (_amount == 0) revert KipuBank_InvalidAmount(_amount);
+
+        uint256 estimatedUSDC = _estimateUSDCamount(_amount, _token);
+        if (estimatedUSDC > i_maxTransaction) 
+            revert KipuBank_TransactionAmountExceeded(_amount, i_maxTransaction);
+
+        if (balanceUSDC + estimatedUSDC > i_bankCap)
+            revert KipuBank_DepositAmountExceeded(balanceUSDC, i_bankCap);
+    }
+
+
+    /**
+     * @notice Valida que se pueda retirar ese monto de USDC. 
+     * @param _amountUSDC Cantidad de USDC que se quiere retirar.
+     */
+    function _validateWithdrawal(uint256 _amountUSDC) internal view {
+        uint256 userBalance = s_userBalances[msg.sender];
+        if (_amountUSDC > userBalance) 
+            revert KipuBank_InsufficientBalance(_amountUSDC, userBalance);
+        if (_amountUSDC > i_maxTransaction) 
+            revert KipuBank_TransactionAmountExceeded(_amountUSDC, i_maxTransaction);
+        if (_amountUSDC == 0) revert KipuBank_InvalidAmount(_amountUSDC);
+    }
+
+    /**
+     *  @notice Estima la cantidad de USDC a ser recibida. 
+     *  @param _amountIn Cantidad del token a convertir.
+     *  @param _tokenIn Direccion del token a transmitir. 
+     */
+    function _estimateUSDCamount(uint256 _amountIn, address _tokenIn) internal view returns(uint256 estimatedUSDC){
+        if (_tokenIn == i_usdcToken) {
+            return _amountIn;
+        }
+    
+        address[] memory path = new address[](2);
+        path[0] = _tokenIn;
+        path[1] = i_usdcToken;
         
-        s_supportedTokens[_token].token.safeTransferFrom(msg.sender,address(this),_amount);
-        //Swap: ERC20 -> USDC
-    }
-
-    /*
-     @notice Funcion para retirar tokens ERC20
-     @param _amount es el monto que se quiere retirar
-     @param _token es el token que se quiere retirar
-    */
-    function withdrawERC20(uint256 _amount, address _token)external validateWithdrawal(_amount, _token){
-        s_users[msg.sender][_token] -= _amount;
-        withdrawalsCount++;
-        //Resto balance USDC
-
-
-        emit KipuBank_WithdrawSuccessful(_amount);  
-        //Swap USDC -> ERC20
-        s_supportedTokens[_token].token.safeTransfer(msg.sender,_amount);
-    }
-    
-    /*///// Funciones de Swap ///////////*/
-    function swap(uint amount0Out, uint amount1Out, address to, bytes calldata data)external{
-
-    }
-
-
-    /*///// Funciones de Admin ////////////*/
-    /*
-     @notice Agrega un nuevo admin. Solo puede ser agregado por otro admin.
-    */
-    function addAdmin() external isAdmin(){
-        _grantRole(ADMIN_ROLE, msg.sender);
-    }
-
-    /*
-     @notice Agrega un nuevo token. Solo puede ser agregado por un admin.
-     @param _newToken es el nuevo token que se quiere agregar.
-    */
-    function addSupportedToken(address _newToken) external isAdmin(){
-        s_supportedTokens[_newToken].isSupported = true;
-        s_supportedTokens[_newToken].token = IERC20(_newToken);
-        emit KipuBank_TokenAddedSuccessfully(_newToken);
-    }
-
-    /*
-     @notice Elimina un token de la lista de tokens soportados. Solo puede ser eliminado por un admin.
-     @param _token es el token que se quiere eliminar.
-    */
-    function deleteSupportedToken(address _token) external isAdmin() tokenIsSupported(_token){
-        s_supportedTokens[_token].isSupported = false;
-        emit KipuBank_TokenDeletedSuccessfully(_token);
+        uint256[] memory amountsOut = i_router.getAmountsOut(_amountIn, path);
+        return amountsOut[1];
     }
 
     /**
-     * @notice función para actualizar el Chainlink Price Feed
-     * @param _feed la nueva dirección del Price Feed
-     * @dev debe ser llamada solo por el propietario
+     * @notice Swap interno de cualquier token a USDC
+     * @param _tokenIn Token de entrada
+     * @param _amountIn Cantidad a intercambiar
+     * @return usdcOut Cantidad de USDC recibida
      */
-    function setFeeds(address _feed) external isAdmin(){
-        s_feeds = AggregatorV3Interface(_feed);
+    function _swapTokenToUSDC(address _tokenIn, uint256 _amountIn) internal returns (uint256 usdcOut) {
+        SafeERC20.forceApprove(IERC20(_tokenIn), address(i_router), _amountIn);
 
-        emit KipuBank_ChainlinkFeedUpdated(_feed);
+        address[] memory path = new address[](2);
+        path[0] = _tokenIn;
+        path[1] = i_usdcToken;
+
+        uint256[] memory amountsOut = i_router.getAmountsOut(_amountIn, path);
+        uint256 expectedUSDC = amountsOut[1];
+        uint256 minUSDC = (expectedUSDC * SLIPPAGE_TOLERANCE) / SLIPPAGE_DENOMINATOR;
+
+        uint256[] memory amounts = i_router.swapExactTokensForTokens(
+            _amountIn,
+            minUSDC,
+            path,
+            address(this),
+            block.timestamp + SWAP_DEADLINE
+        );
+
+        usdcOut = amounts[1];
     }
-
-    /*/////////////////////////
-            Internal
-    /////////////////////////*/
 
     /**
-     * @notice función interna para realizar la conversión de decimales de ETH a USDC
-     * @param _ethAmount la cantidad de ETH a ser convertida
-     * @return convertedAmount_ el resultado del cálculo.
+     * @notice Swap interno de USDC a ETH
+     * @param _amountUSDC Cantidad de USDC a intercambiar
+     * @param _recipient Receptor del ETH
+     * @return ethOut Cantidad de ETH recibida
      */
-    function convertEthInUSD(uint256 _ethAmount) internal view returns (uint256 convertedAmount_) {
-        convertedAmount_ = (_ethAmount * chainlinkFeed()) / DECIMAL_FACTOR;
+    function _swapUSDCToETH(uint256 _amountUSDC, address _recipient) internal returns (uint256 ethOut){
+        SafeERC20.forceApprove(IERC20(i_usdcToken), address(i_router), _amountUSDC);
+
+        address[] memory path = new address[](2);
+        path[0] = i_usdcToken;
+        path[1] = i_router.WETH();
+
+        uint256[] memory amountsOut = i_router.getAmountsOut(_amountUSDC, path);
+        uint256 expectedETH = amountsOut[1];
+        uint256 minETH = (expectedETH * SLIPPAGE_TOLERANCE) / SLIPPAGE_DENOMINATOR;
+
+        uint256[] memory amounts = i_router.swapExactTokensForETH(
+            _amountUSDC,
+            minETH,
+            path,
+            _recipient,
+            block.timestamp + SWAP_DEADLINE
+        );
+
+        ethOut = amounts[1];
     }
 
-        /**
-     * @notice función para consultar el precio en USD del ETH
-     * @return ethUSDPrice_ el precio provisto por el oráculo.
-     * @dev esta es una implementación simplificada, y no sigue completamente las buenas prácticas
+    /**
+     * @notice Swap interno de USDC a cualquier token
+     * @param _amountUSDC Cantidad de USDC a intercambiar
+     * @param _tokenOut Token de salida
+     * @param _recipient Receptor del token
+     * @return tokenOut Cantidad del token recibida
      */
-    function chainlinkFeed() internal view returns (uint256 ethUSDPrice_) {
-        (, int256 ethUSDPrice,, uint256 updatedAt,) = s_feeds.latestRoundData();
+    function _swapUSDCToToken(uint256 _amountUSDC, address _tokenOut, address _recipient) internal returns (uint256 tokenOut){
+        SafeERC20.forceApprove(IERC20(i_usdcToken), address(i_router), _amountUSDC);
 
-        if (ethUSDPrice == 0) revert KipuBank_OracleCompromised();
-        if (block.timestamp - updatedAt > ORACLE_HEARTBEAT)revert KipuBank_StalePrice();
+        address[] memory path = new address[](2);
+        path[0] = i_usdcToken;
+        path[1] = _tokenOut;
 
-        ethUSDPrice_ = uint256(ethUSDPrice);
+        uint256[] memory amountsOut = i_router.getAmountsOut(_amountUSDC, path);
+        uint256 expectedToken = amountsOut[1];
+        uint256 minToken = (expectedToken * SLIPPAGE_TOLERANCE) / SLIPPAGE_DENOMINATOR;
+
+        uint256[] memory amounts = i_router.swapExactTokensForTokens(
+            _amountUSDC,
+            minToken,
+            path,
+            _recipient,
+            block.timestamp + SWAP_DEADLINE
+        );
+
+        tokenOut = amounts[1];
     }
 
-    /*/////////////////////////
-            Private
-    /////////////////////////*/
-    /*
-     @notice ejecuta la transferencia de ETH a la address
-     @param _to es la address a la cual se le transfiere el ETH
-    */
-    function _transferETH(address _to,uint256 _amount) private{
-        (bool isSuccessful, bytes memory error) = _to.call{value: _amount}("");
-        if(!isSuccessful) revert KipuBank_TransferFailed(error);
+
+
+    /*/////////////////////
+        View Functions
+    /////////////////////*/
+
+    /**
+     * @notice Consulta el balance en USDC de un usuario
+     * @return balance Balance del usuario en USDC
+     */
+    function consultarSaldoUSDC() external view returns (uint256 balance) {
+        balance = s_userBalances[msg.sender];
     }
 
-    /*/////////////////////////
-               View
-    /////////////////////////*/
-    /*
-     @notice Funcion que devuelve el saldo de una cuenta.
-     @return _balance es el saldo de la cuenta.
-    */
-    function consultarSaldoETH()external view returns (uint256 _balance){
-        _balance = s_users[msg.sender][address(0)];
+    /**
+     * @notice Estima cuánto USDC recibirías al depositar un token
+     * @param _amountIn Cantidad del token a depositar
+     * @param _tokenIn Dirección del token
+     * @return estimatedUSDC Cantidad estimada de USDC
+     */
+    function estimateDepositERC20(uint256 _amountIn, address _tokenIn) external view returns (uint256 estimatedUSDC) {
+        if (_tokenIn == i_usdcToken) {
+            return _amountIn;
+        }
+
+        address[] memory path = new address[](2);
+        path[0] = _tokenIn;
+        path[1] = i_usdcToken;
+
+        uint256[] memory amounts = i_router.getAmountsOut(_amountIn, path);
+        estimatedUSDC = amounts[1];
     }
 
-    /*
-     @notice Funcion que devuelve el saldo de una cuenta.
-     @return _balance es el saldo de la cuenta.
-    */
-    function consultarSaldoERC20(address _token)external view tokenIsSupported(_token) returns (uint256 _balance){
-        _balance = s_users[msg.sender][_token];
+    /**
+     * @notice Estima cuánto ETH recibirías al retirar USDC
+     * @param _amountUSDC Cantidad de USDC a gastar
+     * @return estimatedETH Cantidad estimada de ETH
+     */
+    function estimateWithdrawETH(uint256 _amountUSDC) external view returns (uint256 estimatedETH){
+        address[] memory path = new address[](2);
+        path[0] = i_usdcToken;
+        path[1] = i_router.WETH();
+
+        uint256[] memory amounts = i_router.getAmountsOut(_amountUSDC, path);
+        estimatedETH = amounts[1];
     }
 
+    /**
+     * @notice Estima cuánto de un token recibirías al retirar USDC
+     * @param _amountUSDC Cantidad de USDC a gastar
+     * @param _tokenOut Token que deseas recibir
+     * @return estimatedTokens Cantidad estimada del token
+     */
+    function estimateWithdrawERC20(uint256 _amountUSDC, address _tokenOut) external view returns (uint256 estimatedTokens){
+        if (_tokenOut == i_usdcToken) {
+            return _amountUSDC;
+        }
+
+        address[] memory path = new address[](2);
+        path[0] = i_usdcToken;
+        path[1] = _tokenOut;
+
+        uint256[] memory amounts = i_router.getAmountsOut(_amountUSDC, path);
+        estimatedTokens = amounts[1];
+    }
 }
