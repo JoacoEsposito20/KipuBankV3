@@ -18,6 +18,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 ///////////////////////*/
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IUniswapV2Router02} from "@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol";
+import {IUniswapV2Factory} from "@uniswap/v2-core/contracts/interfaces/IUniswapV2Factory.sol";
 
 contract KipuBankV3 is AccessControl, ReentrancyGuard {
     /*///////////////////////
@@ -31,6 +32,7 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
     bytes32 private constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
 
     IUniswapV2Router02 public immutable i_router;
+    IUniswapV2Factory public immutable i_uniswapFactory;
     address public immutable i_usdcToken;
 
     uint256 private constant SLIPPAGE_TOLERANCE = 98; // 2% slippage tolerance
@@ -68,6 +70,7 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
     error KipuBank_InvalidAddress(address addr);
     error KipuBank_SwapFailed(string reason);
     error KipuBank_SlippageTooHigh(uint256 expected, uint256 minimum);
+    error KipuBank_PairNotFound(address token);
 
     /*//////////////////////////
             Modifiers
@@ -102,7 +105,7 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
      * @param _router Direccion del Uniswap V2 Router
      * @param _usdc Direccion del token USDC
      */
-    constructor(uint256 _amountBankCap, uint256 _maxTransaction, address _admin, address _router, address _usdc) {
+    constructor(uint256 _amountBankCap, uint256 _maxTransaction, address _admin, address _router, address _factory, address _usdc) {
         if (_admin == address(0) || _router == address(0) || _usdc == address(0)) {
             revert KipuBank_InvalidAddress(address(0));
         }
@@ -115,6 +118,8 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
         _grantRole(ADMIN_ROLE, _admin);
 
         i_router = IUniswapV2Router02(_router);
+        i_uniswapFactory = IUniswapV2Factory(_factory);
+
         i_usdcToken = _usdc;
         i_bankCap = _amountBankCap;
         i_maxTransaction = _maxTransaction;
@@ -155,10 +160,8 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
 
         uint256 usdcReceived = amounts[1];
 
-        //Puede pasar que la estimacion sea menor a lo obtenido realmente
-        if (balanceUSDC + usdcReceived > i_bankCap) {
-            revert KipuBank_DepositAmountExceeded(balanceUSDC, i_bankCap);
-        }
+        //Verifica BankCap Post Swap
+        if (balanceUSDC + usdcReceived > i_bankCap) {revert KipuBank_DepositAmountExceeded(balanceUSDC, i_bankCap);}
 
         s_userBalances[msg.sender] += usdcReceived;
         balanceUSDC += usdcReceived;
@@ -174,11 +177,7 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
      * @param _tokenIn Dirección del token a depositar
      * @dev Si el token es USDC, se deposita directamente. Si es otro token, se hace swap.
      */
-    function depositERC20(uint256 _amountIn, address _tokenIn)
-        external
-        nonReentrant
-        validateDeposit(_amountIn, _tokenIn)
-    {
+    function depositERC20(uint256 _amountIn, address _tokenIn)external nonReentrant validateDeposit(_amountIn, _tokenIn){
         uint256 usdcReceived;
 
         IERC20(_tokenIn).safeTransferFrom(msg.sender, address(this), _amountIn);
@@ -193,10 +192,8 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
             emit KipuBank_SwapExecuted(msg.sender, _tokenIn, i_usdcToken, _amountIn, usdcReceived);
         }
 
-        //Puede pasar que la estimacion sea menor a lo obtenido realmente
-        if (balanceUSDC + usdcReceived > i_bankCap) {
-            revert KipuBank_DepositAmountExceeded(balanceUSDC, i_bankCap);
-        }
+        //Verifica BankCap PostSwap
+        if (balanceUSDC + usdcReceived > i_bankCap) {revert KipuBank_DepositAmountExceeded(balanceUSDC, i_bankCap);}
 
         s_userBalances[msg.sender] += usdcReceived;
         balanceUSDC += usdcReceived;
@@ -210,49 +207,17 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
     /////////////////////*/
 
     /**
-     * @notice Retira una cantidad de USDC en ETH
-     * @param _amountUSDC Cantidad de USDC a gastar para obtener ETH
+     * @notice Retira en USDC
+     * @param _amountUSDC Cantidad de USDC a retirar
      */
-    function withdrawETH(uint256 _amountUSDC) external nonReentrant validateWithdrawal(_amountUSDC) {
+    function withdraw(uint256 _amountUSDC) external nonReentrant validateWithdrawal(_amountUSDC){
         s_userBalances[msg.sender] -= _amountUSDC;
         balanceUSDC -= _amountUSDC;
 
-        uint256 ethReceived = _swapUSDCToETH(_amountUSDC, msg.sender);
+        IERC20(i_usdcToken).safeTransfer(msg.sender, _amountUSDC);
 
         withdrawalsCount++;
-
-        emit KipuBank_SwapExecuted(msg.sender, i_usdcToken, i_router.WETH(), _amountUSDC, ethReceived);
-        emit KipuBank_WithdrawSuccessful(msg.sender, ethReceived);
-    }
-
-    /**
-     * @notice Retira en USDC o en otro token ERC20
-     * @param _amountUSDC Cantidad de USDC a gastar
-     * @param _tokenOut Token que se desea recibir (usar i_usdcToken para USDC directo)
-     */
-    function withdrawERC20(uint256 _amountUSDC, address _tokenOut)
-        external
-        nonReentrant
-        validateWithdrawal(_amountUSDC)
-    {
-        if (_tokenOut == address(0)) revert KipuBank_InvalidAddress(_tokenOut); //Para ETH esta el metodo withdrawETH
-
-        s_userBalances[msg.sender] -= _amountUSDC;
-        balanceUSDC -= _amountUSDC;
-
-        uint256 tokenAmountOut;
-
-        if (_tokenOut == i_usdcToken) {
-            IERC20(i_usdcToken).safeTransfer(msg.sender, _amountUSDC);
-            tokenAmountOut = _amountUSDC;
-        } else {
-            tokenAmountOut = _swapUSDCToToken(_amountUSDC, _tokenOut, msg.sender);
-
-            emit KipuBank_SwapExecuted(msg.sender, i_usdcToken, _tokenOut, _amountUSDC, tokenAmountOut);
-        }
-
-        withdrawalsCount++;
-        emit KipuBank_WithdrawSuccessful(msg.sender, tokenAmountOut);
+        emit KipuBank_WithdrawSuccessful(msg.sender, _amountUSDC);
     }
 
     /*/////////////////////
@@ -297,12 +262,8 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
      */
     function _validateWithdrawal(uint256 _amountUSDC) internal view {
         uint256 userBalance = s_userBalances[msg.sender];
-        if (_amountUSDC > userBalance) {
-            revert KipuBank_InsufficientBalance(_amountUSDC, userBalance);
-        }
-        if (_amountUSDC > i_maxTransaction) {
-            revert KipuBank_TransactionAmountExceeded(_amountUSDC, i_maxTransaction);
-        }
+        if (_amountUSDC > userBalance) {revert KipuBank_InsufficientBalance(_amountUSDC, userBalance);}
+        if (_amountUSDC > i_maxTransaction) {revert KipuBank_TransactionAmountExceeded(_amountUSDC, i_maxTransaction);}
         if (_amountUSDC == 0) revert KipuBank_InvalidAmount(_amountUSDC);
     }
 
@@ -312,16 +273,23 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
      *  @param _tokenIn Direccion del token a transmitir.
      */
     function _estimateUSDCamount(uint256 _amountIn, address _tokenIn) internal view returns (uint256 estimatedUSDC) {
-        if (_tokenIn == i_usdcToken) {
-            return _amountIn;
+        if (_tokenIn == i_usdcToken) {return _amountIn;}
+
+        address[] memory path;
+
+        if(_hasPairWithUSDC(_tokenIn)){
+            path = new address[](2);
+            path[0] = _tokenIn;
+            path[1] = i_usdcToken;
+        }else{
+            path = new address[](3);
+            path[0] = _tokenIn;
+            path[1] = i_router.WETH();
+            path[2] = i_usdcToken;
         }
 
-        address[] memory path = new address[](2);
-        path[0] = _tokenIn;
-        path[1] = i_usdcToken;
-
         uint256[] memory amountsOut = i_router.getAmountsOut(_amountIn, path);
-        return amountsOut[1];
+        return amountsOut[path.length - 1];
     }
 
     /**
@@ -333,68 +301,32 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
     function _swapTokenToUSDC(address _tokenIn, uint256 _amountIn) internal returns (uint256 usdcOut) {
         SafeERC20.forceApprove(IERC20(_tokenIn), address(i_router), _amountIn);
 
-        address[] memory path = new address[](2);
-        path[0] = _tokenIn;
-        path[1] = i_usdcToken;
+        address[] memory path;
+
+        if(_hasPairWithUSDC(_tokenIn)){
+            path = new address[](2);
+            path[0] = _tokenIn;
+            path[1] = i_usdcToken;
+        }else{
+            path = new address[](3);
+            path[0] = _tokenIn;
+            path[1] = i_router.WETH();
+            path[2] = i_usdcToken;
+        }
 
         uint256[] memory amountsOut = i_router.getAmountsOut(_amountIn, path);
-        uint256 expectedUSDC = amountsOut[1];
+        uint256 expectedUSDC = amountsOut[path.length-1];
         uint256 minUSDC = (expectedUSDC * SLIPPAGE_TOLERANCE) / SLIPPAGE_DENOMINATOR;
 
         uint256[] memory amounts =
             i_router.swapExactTokensForTokens(_amountIn, minUSDC, path, address(this), block.timestamp + SWAP_DEADLINE);
 
-        usdcOut = amounts[1];
+        usdcOut = amounts[path.length-1];
     }
 
-    /**
-     * @notice Swap interno de USDC a ETH
-     * @param _amountUSDC Cantidad de USDC a intercambiar
-     * @param _recipient Receptor del ETH
-     * @return ethOut Cantidad de ETH recibida
-     */
-    function _swapUSDCToETH(uint256 _amountUSDC, address _recipient) internal returns (uint256 ethOut) {
-        SafeERC20.forceApprove(IERC20(i_usdcToken), address(i_router), _amountUSDC);
-
-        address[] memory path = new address[](2);
-        path[0] = i_usdcToken;
-        path[1] = i_router.WETH();
-
-        uint256[] memory amountsOut = i_router.getAmountsOut(_amountUSDC, path);
-        uint256 expectedETH = amountsOut[1];
-        uint256 minETH = (expectedETH * SLIPPAGE_TOLERANCE) / SLIPPAGE_DENOMINATOR;
-
-        uint256[] memory amounts =
-            i_router.swapExactTokensForETH(_amountUSDC, minETH, path, _recipient, block.timestamp + SWAP_DEADLINE);
-
-        ethOut = amounts[1];
-    }
-
-    /**
-     * @notice Swap interno de USDC a cualquier token
-     * @param _amountUSDC Cantidad de USDC a intercambiar
-     * @param _tokenOut Token de salida
-     * @param _recipient Receptor del token
-     * @return tokenOut Cantidad del token recibida
-     */
-    function _swapUSDCToToken(uint256 _amountUSDC, address _tokenOut, address _recipient)
-        internal
-        returns (uint256 tokenOut)
-    {
-        SafeERC20.forceApprove(IERC20(i_usdcToken), address(i_router), _amountUSDC);
-
-        address[] memory path = new address[](2);
-        path[0] = i_usdcToken;
-        path[1] = _tokenOut;
-
-        uint256[] memory amountsOut = i_router.getAmountsOut(_amountUSDC, path);
-        uint256 expectedToken = amountsOut[1];
-        uint256 minToken = (expectedToken * SLIPPAGE_TOLERANCE) / SLIPPAGE_DENOMINATOR;
-
-        uint256[] memory amounts =
-            i_router.swapExactTokensForTokens(_amountUSDC, minToken, path, _recipient, block.timestamp + SWAP_DEADLINE);
-
-        tokenOut = amounts[1];
+    function _hasPairWithUSDC(address token) internal view returns (bool) {
+        address pair = i_uniswapFactory.getPair(token, address(IERC20(i_usdcToken)));
+        return pair != address(0);
     }
 
     /*/////////////////////
@@ -407,61 +339,5 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
      */
     function consultarSaldoUSDC() external view returns (uint256 balance) {
         balance = s_userBalances[msg.sender];
-    }
-
-    /**
-     * @notice Estima cuánto USDC recibirías al depositar un token
-     * @param _amountIn Cantidad del token a depositar
-     * @param _tokenIn Dirección del token
-     * @return estimatedUSDC Cantidad estimada de USDC
-     */
-    function estimateDepositERC20(uint256 _amountIn, address _tokenIn) external view returns (uint256 estimatedUSDC) {
-        if (_tokenIn == i_usdcToken) {
-            return _amountIn;
-        }
-
-        address[] memory path = new address[](2);
-        path[0] = _tokenIn;
-        path[1] = i_usdcToken;
-
-        uint256[] memory amounts = i_router.getAmountsOut(_amountIn, path);
-        estimatedUSDC = amounts[1];
-    }
-
-    /**
-     * @notice Estima cuánto ETH recibirías al retirar USDC
-     * @param _amountUSDC Cantidad de USDC a gastar
-     * @return estimatedETH Cantidad estimada de ETH
-     */
-    function estimateWithdrawETH(uint256 _amountUSDC) external view returns (uint256 estimatedETH) {
-        address[] memory path = new address[](2);
-        path[0] = i_usdcToken;
-        path[1] = i_router.WETH();
-
-        uint256[] memory amounts = i_router.getAmountsOut(_amountUSDC, path);
-        estimatedETH = amounts[1];
-    }
-
-    /**
-     * @notice Estima cuánto de un token recibirías al retirar USDC
-     * @param _amountUSDC Cantidad de USDC a gastar
-     * @param _tokenOut Token que deseas recibir
-     * @return estimatedTokens Cantidad estimada del token
-     */
-    function estimateWithdrawERC20(uint256 _amountUSDC, address _tokenOut)
-        external
-        view
-        returns (uint256 estimatedTokens)
-    {
-        if (_tokenOut == i_usdcToken) {
-            return _amountUSDC;
-        }
-
-        address[] memory path = new address[](2);
-        path[0] = i_usdcToken;
-        path[1] = _tokenOut;
-
-        uint256[] memory amounts = i_router.getAmountsOut(_amountUSDC, path);
-        estimatedTokens = amounts[1];
     }
 }
