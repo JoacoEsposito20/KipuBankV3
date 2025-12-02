@@ -105,7 +105,14 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
      * @param _router Direccion del Uniswap V2 Router
      * @param _usdc Direccion del token USDC
      */
-    constructor(uint256 _amountBankCap, uint256 _maxTransaction, address _admin, address _router, address _factory, address _usdc) {
+    constructor(
+        uint256 _amountBankCap,
+        uint256 _maxTransaction,
+        address _admin,
+        address _router,
+        address _factory,
+        address _usdc
+    ) {
         if (_admin == address(0) || _router == address(0) || _usdc == address(0)) {
             revert KipuBank_InvalidAddress(address(0));
         }
@@ -161,7 +168,7 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
         uint256 usdcReceived = amounts[1];
 
         //Verifica BankCap Post Swap
-        if (balanceUSDC + usdcReceived > i_bankCap) {revert KipuBank_DepositAmountExceeded(balanceUSDC, i_bankCap);}
+        if (balanceUSDC + usdcReceived > i_bankCap) revert KipuBank_DepositAmountExceeded(balanceUSDC, i_bankCap);
 
         s_userBalances[msg.sender] += usdcReceived;
         balanceUSDC += usdcReceived;
@@ -177,7 +184,11 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
      * @param _tokenIn Dirección del token a depositar
      * @dev Si el token es USDC, se deposita directamente. Si es otro token, se hace swap.
      */
-    function depositERC20(uint256 _amountIn, address _tokenIn)external nonReentrant validateDeposit(_amountIn, _tokenIn){
+    function depositERC20(uint256 _amountIn, address _tokenIn)
+        external
+        nonReentrant
+        validateDeposit(_amountIn, _tokenIn)
+    {
         uint256 usdcReceived;
 
         IERC20(_tokenIn).safeTransferFrom(msg.sender, address(this), _amountIn);
@@ -193,7 +204,7 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
         }
 
         //Verifica BankCap PostSwap
-        if (balanceUSDC + usdcReceived > i_bankCap) {revert KipuBank_DepositAmountExceeded(balanceUSDC, i_bankCap);}
+        if (balanceUSDC + usdcReceived > i_bankCap) revert KipuBank_DepositAmountExceeded(balanceUSDC, i_bankCap);
 
         s_userBalances[msg.sender] += usdcReceived;
         balanceUSDC += usdcReceived;
@@ -210,7 +221,7 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
      * @notice Retira en USDC
      * @param _amountUSDC Cantidad de USDC a retirar
      */
-    function withdraw(uint256 _amountUSDC) external nonReentrant validateWithdrawal(_amountUSDC){
+    function withdraw(uint256 _amountUSDC) external nonReentrant validateWithdrawal(_amountUSDC) {
         s_userBalances[msg.sender] -= _amountUSDC;
         balanceUSDC -= _amountUSDC;
 
@@ -262,8 +273,8 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
      */
     function _validateWithdrawal(uint256 _amountUSDC) internal view {
         uint256 userBalance = s_userBalances[msg.sender];
-        if (_amountUSDC > userBalance) {revert KipuBank_InsufficientBalance(_amountUSDC, userBalance);}
-        if (_amountUSDC > i_maxTransaction) {revert KipuBank_TransactionAmountExceeded(_amountUSDC, i_maxTransaction);}
+        if (_amountUSDC > userBalance) revert KipuBank_InsufficientBalance(_amountUSDC, userBalance);
+        if (_amountUSDC > i_maxTransaction) revert KipuBank_TransactionAmountExceeded(_amountUSDC, i_maxTransaction);
         if (_amountUSDC == 0) revert KipuBank_InvalidAmount(_amountUSDC);
     }
 
@@ -273,15 +284,15 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
      *  @param _tokenIn Direccion del token a transmitir.
      */
     function _estimateUSDCamount(uint256 _amountIn, address _tokenIn) internal view returns (uint256 estimatedUSDC) {
-        if (_tokenIn == i_usdcToken) {return _amountIn;}
+        if (_tokenIn == i_usdcToken) return _amountIn;
 
         address[] memory path;
 
-        if(_hasPairWithUSDC(_tokenIn)){
+        if (_hasPairWithUSDC(_tokenIn)) {
             path = new address[](2);
             path[0] = _tokenIn;
             path[1] = i_usdcToken;
-        }else{
+        } else {
             path = new address[](3);
             path[0] = _tokenIn;
             path[1] = i_router.WETH();
@@ -303,11 +314,11 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
 
         address[] memory path;
 
-        if(_hasPairWithUSDC(_tokenIn)){
+        if (_hasPairWithUSDC(_tokenIn)) {
             path = new address[](2);
             path[0] = _tokenIn;
             path[1] = i_usdcToken;
-        }else{
+        } else {
             path = new address[](3);
             path[0] = _tokenIn;
             path[1] = i_router.WETH();
@@ -315,13 +326,13 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
         }
 
         uint256[] memory amountsOut = i_router.getAmountsOut(_amountIn, path);
-        uint256 expectedUSDC = amountsOut[path.length-1];
+        uint256 expectedUSDC = amountsOut[path.length - 1];
         uint256 minUSDC = (expectedUSDC * SLIPPAGE_TOLERANCE) / SLIPPAGE_DENOMINATOR;
 
         uint256[] memory amounts =
             i_router.swapExactTokensForTokens(_amountIn, minUSDC, path, address(this), block.timestamp + SWAP_DEADLINE);
 
-        usdcOut = amounts[path.length-1];
+        usdcOut = amounts[path.length - 1];
     }
 
     function _hasPairWithUSDC(address token) internal view returns (bool) {
